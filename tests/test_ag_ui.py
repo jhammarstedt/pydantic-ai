@@ -27,9 +27,11 @@ from pydantic_ai import (
     PartDeltaEvent,
     PartEndEvent,
     PartStartEvent,
+    RetryPromptPart,
     SystemPromptPart,
     TextPart,
     TextPartDelta,
+    ThinkingPart,
     ToolCallPart,
     ToolCallPartDelta,
     ToolReturn,
@@ -1966,3 +1968,189 @@ async def test_handle_ag_ui_request():
             {'type': 'http.response.body', 'body': b'', 'more_body': False},
         ]
     )
+
+
+async def test_dump_messages() -> None:
+    """Test AGUIAdapter.dump_messages() method."""
+    messages = [
+        ModelRequest(
+            parts=[
+                SystemPromptPart(
+                    content='System message',
+                ),
+                SystemPromptPart(
+                    content='Developer message',
+                ),
+                UserPromptPart(
+                    content='User message',
+                ),
+                UserPromptPart(
+                    content='User message',
+                ),
+            ]
+        ),
+        ModelResponse(
+            parts=[
+                BuiltinToolCallPart(
+                    tool_name='web_search',
+                    args='{"query": "Hello, world!"}',
+                    tool_call_id='search_1',
+                    provider_name='function',
+                ),
+                BuiltinToolReturnPart(
+                    tool_name='web_search',
+                    content='{"results": [{"title": "Hello, world!", "url": "https://en.wikipedia.org/wiki/Hello,_world!"}]}',
+                    tool_call_id='search_1',
+                    provider_name='function',
+                ),
+                TextPart(content='Assistant message'),
+                ToolCallPart(tool_name='tool_call_1', args='{}', tool_call_id='tool_call_1'),
+                ToolCallPart(tool_name='tool_call_2', args='{}', tool_call_id='tool_call_2'),
+            ],
+        ),
+        ModelRequest(
+            parts=[
+                ToolReturnPart(
+                    tool_name='tool_call_1',
+                    content='Tool message',
+                    tool_call_id='tool_call_1',
+                ),
+                ToolReturnPart(
+                    tool_name='tool_call_2',
+                    content='Tool message',
+                    tool_call_id='tool_call_2',
+                ),
+                UserPromptPart(
+                    content='User message',
+                ),
+            ]
+        ),
+        ModelResponse(
+            parts=[TextPart(content='Assistant message')],
+        ),
+    ]
+
+    result = AGUIAdapter.dump_messages(messages)
+
+    # Check structure and count
+    assert len(result) == 10
+    # Check message types and content
+    assert isinstance(result[0], SystemMessage)
+    assert result[0].content == 'System message'
+
+    assert isinstance(result[1], SystemMessage)
+    assert result[1].content == 'Developer message'
+
+    assert isinstance(result[2], UserMessage)
+    assert result[2].content == 'User message'
+
+    assert isinstance(result[3], UserMessage)
+    assert result[3].content == 'User message'
+
+    # Check Assistant message with tool calls
+    assert isinstance(result[4], AssistantMessage)
+    assert result[4].content == 'Assistant message'
+    assert result[4].tool_calls is not None
+    assert len(result[4].tool_calls) == 3
+    assert result[4].tool_calls[0].id == 'pyd_ai_builtin|function|search_1'
+    assert result[4].tool_calls[0].function.name == 'web_search'
+    assert result[4].tool_calls[1].id == 'tool_call_1'
+    assert result[4].tool_calls[2].id == 'tool_call_2'
+
+    # Check builtin tool return
+    assert isinstance(result[5], ToolMessage)
+    assert result[5].tool_call_id == 'pyd_ai_builtin|function|search_1'
+    assert result[5].content is not None
+    assert '{"results":' in result[5].content
+
+    # Check regular tool returns
+    assert isinstance(result[6], ToolMessage)
+    assert result[6].tool_call_id == 'tool_call_1'
+    assert result[6].content is not None
+    assert result[6].content == 'Tool message'
+
+    assert isinstance(result[7], ToolMessage)
+    assert result[7].tool_call_id == 'tool_call_2'
+    assert result[7].content == 'Tool message'
+
+    # Check final user and assistant messages
+    assert isinstance(result[8], UserMessage)
+    assert result[8].content == 'User message'
+
+    assert isinstance(result[9], AssistantMessage)
+    assert result[9].content == 'Assistant message'
+
+
+async def test_dump_messages_retry_prompt() -> None:
+    """Test conversion including RetryPromptPart, ThinkingPart, and empty ModelResponse."""
+    messages = [
+        ModelRequest(
+            parts=[
+                UserPromptPart(content='Initial question'),
+                RetryPromptPart(content='Please provide more details'),
+            ]
+        ),
+        ModelResponse(
+            parts=[
+                ThinkingPart(content='Let me think...'),  # Should be skipped
+            ]
+        ),  # Should not create any message (only ThinkingPart)
+        ModelRequest(
+            parts=[
+                UserPromptPart(content='Follow-up question'),
+            ]
+        ),
+        ModelResponse(
+            parts=[
+                ThinkingPart(content='Thinking more...'),  # Should be skipped
+                TextPart(content='Final answer'),
+            ],
+        ),
+    ]
+
+    result = AGUIAdapter.dump_messages(messages)
+
+    # Should have: UserMessage, ToolMessage (from RetryPromptPart), UserMessage, AssistantMessage
+    # ThinkingPart should be skipped, empty ModelResponse should create no message
+    assert len(result) == 4
+
+    assert isinstance(result[0], UserMessage)
+    assert result[0].content == 'Initial question'
+
+    # RetryPromptPart always has a tool_call_id (auto-generated if not provided) and becomes ToolMessage
+    assert isinstance(result[1], ToolMessage)
+    # model_response() adds "Validation feedback:" prefix for RetryPromptPart without tool_name
+    assert 'Please provide more details' in result[1].content
+    assert 'Validation feedback:' in result[1].content
+
+    assert isinstance(result[2], UserMessage)
+    assert result[2].content == 'Follow-up question'
+
+    assert isinstance(result[3], AssistantMessage)
+    assert result[3].content == 'Final answer'
+
+
+async def test_dump_messages_retry_prompt_with_tool_name() -> None:
+    """Test RetryPromptPart with explicit tool_name and tool_call_id."""
+    messages = [
+        ModelRequest(
+            parts=[
+                RetryPromptPart(
+                    content='Invalid input: expected number',
+                    tool_name='calculate',
+                    tool_call_id='tool_1',
+                ),
+            ]
+        ),
+    ]
+
+    result = AGUIAdapter.dump_messages(messages)
+
+    assert len(result) == 1
+    assert isinstance(result[0], ToolMessage)
+    assert result[0].tool_call_id == 'tool_1'
+    # When tool_name is provided, model_response() returns content without "Validation feedback:" prefix
+    # but always appends "Fix the errors and try again."
+    assert 'Invalid input: expected number' in result[0].content
+    assert 'Fix the errors and try again.' in result[0].content
+    assert 'Validation feedback:' not in result[0].content

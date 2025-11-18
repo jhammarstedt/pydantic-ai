@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import uuid
 from collections.abc import Sequence
 from functools import cached_property
 from typing import (
@@ -11,11 +12,18 @@ from typing import (
 
 from ... import ExternalToolset, ToolDefinition
 from ...messages import (
+    BaseToolCallPart,
     BuiltinToolCallPart,
     BuiltinToolReturnPart,
     ModelMessage,
+    ModelRequest,
+    ModelRequestPart,
+    ModelResponse,
+    ModelResponsePart,
+    RetryPromptPart,
     SystemPromptPart,
     TextPart,
+    ThinkingPart,
     ToolCallPart,
     ToolReturnPart,
     UserPromptPart,
@@ -29,10 +37,12 @@ try:
         AssistantMessage,
         BaseEvent,
         DeveloperMessage,
+        FunctionCall,
         Message,
         RunAgentInput,
         SystemMessage,
         Tool as AGUITool,
+        ToolCall,
         ToolMessage,
         UserMessage,
     )
@@ -185,3 +195,172 @@ class AGUIAdapter(UIAdapter[RunAgentInput, Message, BaseEvent, AgentDepsT, Outpu
                     )
 
         return builder.messages
+
+    @classmethod
+    def dump_messages(cls, messages: Sequence[ModelMessage]) -> list[Message]:
+        """Transform Pydantic AI messages into AG-UI messages.
+
+        This is the reverse operation of [`load_messages`][pydantic_ai.ui.ag_ui.AGUIAdapter.load_messages].
+
+        Args:
+            messages: Sequence of Pydantic AI ModelMessage objects (ModelRequest or ModelResponse).
+
+        Returns:
+            List of AG-UI Message objects.
+
+        Example:
+            ```python
+            from pydantic_ai.messages import ModelRequest, UserPromptPart
+            from pydantic_ai.ui.ag_ui import AGUIAdapter
+
+            messages = [ModelRequest(parts=[UserPromptPart(content='Hello!')])]
+            ag_ui_messages = AGUIAdapter.dump_messages(messages)
+            ```
+
+        Notes:
+            - `ModelRequest` parts (UserPromptPart, SystemPromptPart, ToolReturnPart, RetryPromptPart)
+              become separate AG-UI messages.
+            - `ModelResponse` parts (TextPart, ToolCallPart, BuiltinToolCallPart) are combined
+              into a single AssistantMessage.
+            - `BuiltinToolReturnPart` becomes a separate ToolMessage with prefixed ID.
+            - `ThinkingPart` is skipped as it's not part of the conversational message history.
+        """
+        result: list[Message] = []
+
+        for message in messages:
+            if isinstance(message, ModelRequest):
+                for part in message.parts:
+                    converted = _convert_request_part(part)
+                    if converted:
+                        result.append(converted)
+
+            elif isinstance(message, ModelResponse):
+                assistant_messages, builtin_returns = _convert_response_parts(message.parts)
+                result.extend(assistant_messages)
+
+                # Create separate ToolMessages for builtin tool returns
+                for builtin_return in builtin_returns:
+                    prefixed_id = _get_builtin_tool_call_id(
+                        builtin_return.tool_call_id, builtin_return.provider_name or ''
+                    )
+                    result.append(
+                        ToolMessage(
+                            id=str(uuid.uuid4()),
+                            tool_call_id=prefixed_id,
+                            content=builtin_return.model_response_str(),
+                        )
+                    )
+
+        return result
+
+
+def _convert_request_part(part: ModelRequestPart) -> Message | None:
+    """Convert a ModelRequest part to an AG-UI message.
+
+    Args:
+        part: A part from a ModelRequest.
+
+    Returns:
+        An AG-UI Message object, or None if the part should be skipped.
+    """
+    match part:
+        case UserPromptPart():
+            return UserMessage(
+                id=str(uuid.uuid4()),
+                content=part.content if isinstance(part.content, str) else str(part.content),
+            )
+        case SystemPromptPart():
+            return SystemMessage(
+                id=str(uuid.uuid4()),
+                content=part.content if isinstance(part.content, str) else str(part.content),
+            )
+        case ToolReturnPart():
+            return ToolMessage(
+                id=str(uuid.uuid4()),
+                tool_call_id=part.tool_call_id,
+                content=part.model_response_str(),
+            )
+        case RetryPromptPart():
+            if part.tool_call_id:
+                return ToolMessage(
+                    id=str(uuid.uuid4()),
+                    tool_call_id=part.tool_call_id,
+                    content=part.model_response(),
+                )
+            else:
+                return UserMessage(
+                    id=str(uuid.uuid4()),
+                    content=part.model_response(),
+                )
+        case _:  # pragma: no cover
+            return None
+
+
+def _convert_response_parts(parts: Sequence[ModelResponsePart]) -> tuple[list[Message], list[BuiltinToolReturnPart]]:
+    """Convert ModelResponse parts to AG-UI messages and collect builtin returns.
+
+    Args:
+        parts: Sequence of parts from a ModelResponse.
+
+    Returns:
+        A tuple of (list of AG-UI messages, list of builtin tool return parts).
+    """
+    content_parts: list[str] = []
+    tool_calls: list[ToolCall] = []
+    builtin_returns: list[BuiltinToolReturnPart] = []
+    last_was_text = False
+
+    for part in parts:
+        if isinstance(part, TextPart):
+            content_parts.append(part.content)
+            last_was_text = True
+        elif isinstance(part, BaseToolCallPart):
+            tool_call_id = part.tool_call_id
+            if isinstance(part, BuiltinToolCallPart):
+                # Text parts that are interrupted by a built-in tool call should not be joined together directly
+                if last_was_text:
+                    content_parts.append('\n\n')
+                    last_was_text = False
+                tool_call_id = _get_builtin_tool_call_id(tool_call_id, part.provider_name or '')
+            tool_calls.append(
+                ToolCall(
+                    id=tool_call_id,
+                    function=FunctionCall(
+                        name=part.tool_name,
+                        arguments=part.args_as_json_str(),
+                    ),
+                )
+            )
+        elif isinstance(part, BuiltinToolReturnPart):
+            builtin_returns.append(part)
+            # Built-in tool returns also interrupt text flow
+            last_was_text = False
+        elif isinstance(part, ThinkingPart):
+            # ThinkingPart is not currently supported in AssistantMessage format
+            # It's handled separately in the streaming events
+            continue
+
+    messages: list[Message] = []
+    if content_parts or tool_calls:
+        messages.append(
+            AssistantMessage(
+                id=str(uuid.uuid4()),
+                content=''.join(content_parts) if content_parts else None,
+                tool_calls=tool_calls if tool_calls else None,
+            )
+        )
+
+    return messages, builtin_returns
+
+
+def _get_builtin_tool_call_id(tool_call_id: str, provider_name: str) -> str:
+    """Generate a prefixed tool call ID for builtin tools.
+
+    Args:
+        tool_call_id: The original tool call ID.
+        provider_name: The name of the provider (e.g., 'function', 'openai').
+
+    Returns:
+        The prefixed tool call ID in the format 'pyd_ai_builtin|{provider_name}|{tool_call_id}'.
+    """
+    return f'{BUILTIN_TOOL_CALL_ID_PREFIX}|{provider_name}|{tool_call_id}'
